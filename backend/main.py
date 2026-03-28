@@ -176,58 +176,63 @@ async def get_orders(sb: Client = Depends(get_supabase)):
     res = sb.table("orders").select("*").order("date_created", desc=True).execute()
     return res.data
 
+from fastapi.concurrency import run_in_threadpool
+
 async def run_sync_job():
     sb = get_supabase()
     print(f"DEBUG: Starting sync from {wc_client.base_url}")
     orders = await wc_client.get_orders()
     print(f"DEBUG: Fetched {len(orders)} orders from WooCommerce")
-    synced_count = 0
-    updated = False
     
-    for order in orders:
-        try:
-            woo_order_id = order.get("id")
-            woo_customer_id = order.get("customer_id")
-            total = float(order.get("total", 0))
-            
-            # 1. Get/Upsert Customer
-            billing = order.get("billing", {})
-            customer_data = {
-                "woo_customer_id": woo_customer_id,
-                "email": billing.get("email"),
-                "first_name": billing.get("first_name"),
-                "last_name": billing.get("last_name"),
-                "total_spend": total,
-                "order_count": 1,
-                "last_order_date": order.get("date_created")
-            }
-            
-            cust_res = sb.table("customers").upsert(customer_data, on_conflict="woo_customer_id").execute()
-            customer = cust_res.data[0]
-            
-            # 2. Check if Order exists
-            existing = sb.table("orders").select("status").eq("woo_order_id", woo_order_id).execute()
-            status_changed = False
-            if not existing.data or existing.data[0]["status"] != order.get("status"):
-                status_changed = True
+    def process_sync():
+        synced_count = 0
+        updated = False
+        for order in orders:
+            try:
+                woo_order_id = order.get("id")
+                woo_customer_id = order.get("customer_id")
+                total = float(order.get("total", 0))
+                
+                # 1. Get/Upsert Customer
+                billing = order.get("billing", {})
+                customer_data = {
+                    "woo_customer_id": woo_customer_id,
+                    "email": billing.get("email"),
+                    "first_name": billing.get("first_name"),
+                    "last_name": billing.get("last_name"),
+                    "total_spend": total,
+                    "order_count": 1,
+                    "last_order_date": order.get("date_created")
+                }
+                
+                cust_res = sb.table("customers").upsert(customer_data, on_conflict="woo_customer_id").execute()
+                customer = cust_res.data[0]
+                
+                # 2. Check if Order exists
+                existing = sb.table("orders").select("status").eq("woo_order_id", woo_order_id).execute()
+                status_changed = False
+                if not existing.data or existing.data[0]["status"] != order.get("status"):
+                    status_changed = True
 
-            # 3. Upsert Order
-            order_data = {
-                "woo_order_id": woo_order_id,
-                "customer_id": customer["id"],
-                "status": order.get("status"),
-                "total": total,
-                "currency": order.get("currency"),
-                "date_created": order.get("date_created")
-            }
-            sb.table("orders").upsert(order_data, on_conflict="woo_order_id").execute()
-            synced_count += 1
-            if status_changed:
-                updated = True
-        except Exception as item_error:
-            print(f"DEBUG: Error syncing order {order.get('id')}: {str(item_error)}")
-            continue
-        
+                # 3. Upsert Order
+                order_data = {
+                    "woo_order_id": woo_order_id,
+                    "customer_id": customer["id"],
+                    "status": order.get("status"),
+                    "total": total,
+                    "currency": order.get("currency"),
+                    "date_created": order.get("date_created")
+                }
+                sb.table("orders").upsert(order_data, on_conflict="woo_order_id").execute()
+                synced_count += 1
+                if status_changed:
+                    updated = True
+            except Exception as item_error:
+                print(f"DEBUG: Error syncing order {order.get('id')}: {str(item_error)}")
+                continue
+        return synced_count, updated
+
+    synced_count, updated = await run_in_threadpool(process_sync)
     print(f"DEBUG: Sync completed. Total synced: {synced_count}")
     return synced_count, updated
 
